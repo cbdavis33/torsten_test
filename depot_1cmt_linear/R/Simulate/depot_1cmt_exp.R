@@ -28,7 +28,7 @@ dosing_data <- expand.ev(ID = 1, addl = 6, ii = 24,
   rename_all(toupper) %>%
   select(ID, TIME, everything()) 
 
-times_to_simulate <- c(0, 0.25, seq(0.5, 24*7, by = 0.5))
+times_to_simulate <- c(0.25, seq(0.5, 24*7, by = 0.5))
 
 nonmem_data_simulate <- dosing_data %>% 
   group_by(ID) %>% 

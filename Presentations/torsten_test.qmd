@@ -1,0 +1,958 @@
+---
+title: "Torsten Issues"
+author: "Casey Davis"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+format:
+  html:
+    code-fold: true  
+    code-summary: "Code"
+    code-tools: true
+    number-sections: true
+    toc: true
+    toc-depth: 5
+    embed-resources: true  
+editor_options: 
+  chunk_output_type: console
+---
+
+```{css, echo = FALSE}
+.scrolling_500 {
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+.scrolling_700 {
+  max-height: 700px;
+  overflow-y: auto;
+}
+```
+
+```{r}
+#| label: package-load
+#| include: true
+#| message: false
+#| warning: false
+#| echo: false
+
+library(mrgsolve)
+library(tidybayes)
+library(posterior)
+library(cmdstanr)
+library(tidyverse)
+
+set_cmdstan_path(here::here("Torsten/cmdstan"))
+
+```
+
+# Introduction
+
+I've been doing some testing with the new Torsten release (v0.91.0) on an M3 
+Macbook Pro. I brought up an issue with M3 compatibility
+[here](https://discourse.mc-stan.org/t/problem-installing-torsten-0-90/27585/12).
+Thank you for fixing that issue. Now I'm doing some more testing, and I'm 
+finding some issues with the Torsten solvers.
+
+I've mostly done testing on my own models, but I've also worked on the 
+```pk2cpt```, ```pk2cpt_linode```, ```pk2cpt_ode```, and ```poppk2cpt``` models,
+For the single subject models, the analytical solution didn't work, the linear 
+ODE solution worked, and the ODE solution didn't work (although I'm not exactly 
+sure why the ODE solution didn't work. Still needs worked on, I guess.) For the 
+population model, the analytical solution and the ODE solution worked with the
+model that you've written, but the linear ODE soolution didn't work. So I then
+used the data in ```poppk2cpt``` and fit it with a model I've written, and the
+linear ODE and general ODE solutions worked, but the analytical solution didn't.
+
+# Some Examples
+
+## Simulate from My Models
+
+I'm starting out with simulations, mainly because it's simpler and faster.
+
+### One-Compartment Oral with Lognormal Error
+
+The following code simulates with Stan + Torsten with an analytical solution, 
+linear ODE solution, and general ODE solution using code I've written in the 
+past, and then also a simulation with mrgsolve as a comparison.
+
+:::{.scrolling_500}
+
+```{r}
+#| cache: true
+
+TVCL <- 0.5
+TVVC <- 12
+TVKA <- 1
+
+omega_cl <- 0
+omega_vc <- 0
+omega_ka <- 0
+
+R <- diag(rep(1, times = 3))
+
+sigma <- 0.2
+
+dosing_data <- expand.ev(ID = 1, addl = 6, ii = 24, 
+                         cmt = 1, amt = 200, ss = 0, tinf = 0, 
+                         evid = 1) %>%
+  as_tibble() %>% 
+  rename_all(toupper) %>%
+  select(ID, TIME, everything()) 
+
+times_to_simulate <- c(0.25, seq(0.5, 24*7, by = 0.5))
+
+nonmem_data_simulate <- dosing_data %>% 
+  group_by(ID) %>% 
+  slice(rep(1, times = length(times_to_simulate))) %>% 
+  mutate(AMT = 0,
+         ADDL = 0,
+         II = 0,
+         CMT = 2,
+         EVID = 0,
+         TIME = times_to_simulate) %>% 
+  ungroup() %>%
+  bind_rows(dosing_data) %>% 
+  arrange(ID, TIME, AMT)
+
+n_subjects <- nonmem_data_simulate %>%  # number of individuals to simulate
+  distinct(ID) %>% 
+  count() %>% 
+  deframe()
+
+n_total <- nrow(nonmem_data_simulate) # total number of time points at which to predict
+
+subj_start <- nonmem_data_simulate %>% 
+  mutate(row_num = 1:n()) %>% 
+  group_by(ID) %>% 
+  slice_head(n = 1) %>%
+  ungroup() %>% 
+  select(row_num) %>% 
+  deframe()
+
+subj_end <- c(subj_start[-1] - 1, n_total) 
+
+stan_data <- list(n_subjects = n_subjects,
+                  n_total = n_total,
+                  time = nonmem_data_simulate$TIME,
+                  amt = nonmem_data_simulate$AMT,
+                  cmt = nonmem_data_simulate$CMT,
+                  evid = nonmem_data_simulate$EVID,
+                  rate = nonmem_data_simulate$RATE,
+                  ii = nonmem_data_simulate$II,
+                  addl = nonmem_data_simulate$ADDL,
+                  ss = nonmem_data_simulate$SS,
+                  subj_start = subj_start,
+                  subj_end = subj_end,
+                  TVCL = TVCL,
+                  TVVC = TVVC,
+                  TVKA = TVKA,
+                  omega_cl = omega_cl,
+                  omega_vc = omega_vc,
+                  omega_ka = omega_ka,
+                  R = R,
+                  sigma = sigma,
+                  solver = 1) # analytical = 1, mat exp = 2, rk45 = 3
+
+model <- cmdstan_model(
+  here::here("depot_1cmt_linear/Stan/Simulate/depot_1cmt_exp.stan"))
+
+model$print()
+```
+
+:::
+
+```{r}
+#| cache: true
+#| output: false
+
+simulated_data <- model$sample(data = stan_data,
+                               fixed_param = TRUE,
+                               seed = 1123,
+                               iter_warmup = 0,
+                               iter_sampling = 1,
+                               chains = 1,
+                               parallel_chains = 1)
+
+data_analytical <- simulated_data$draws(c("dv", "ipred")) %>% 
+  spread_draws(dv[i], ipred[i]) %>% 
+  ungroup() %>% 
+  inner_join(nonmem_data_simulate %>% 
+               mutate(i = 1:n()),
+             by = "i") %>%
+  select(ID, AMT, II, ADDL, RATE, CMT, EVID, SS, TIME, 
+         DV = "dv", IPRED = "ipred") %>% 
+  mutate(LLOQ = 1e-6, 
+         BLOQ = case_when(EVID == 1 ~ NA_real_,
+                          DV <= LLOQ ~ 1,
+                          DV > LLOQ ~ 0,
+                          TRUE ~ NA_real_),
+         DV = if_else(EVID == 1 | BLOQ == 1, NA_real_, DV),
+         MDV = if_else(is.na(DV), 1, 0)) %>% 
+  relocate(DV, .after = last_col()) %>% 
+  relocate(TIME, .before = DV) %>% 
+  mutate(solver = "analytical")
+
+
+stan_data$solver <- 2
+simulated_data <- model$sample(data = stan_data,
+                               fixed_param = TRUE,
+                               seed = 1123,
+                               iter_warmup = 0,
+                               iter_sampling = 1,
+                               chains = 1,
+                               parallel_chains = 1)
+
+data_mat_exp <- simulated_data$draws(c("dv", "ipred")) %>% 
+  spread_draws(dv[i], ipred[i]) %>% 
+  ungroup() %>% 
+  inner_join(nonmem_data_simulate %>% 
+               mutate(i = 1:n()),
+             by = "i") %>%
+  select(ID, AMT, II, ADDL, RATE, CMT, EVID, SS, TIME, 
+         DV = "dv", IPRED = "ipred") %>% 
+  mutate(LLOQ = 1e-6, 
+         BLOQ = case_when(EVID == 1 ~ NA_real_,
+                          DV <= LLOQ ~ 1,
+                          DV > LLOQ ~ 0,
+                          TRUE ~ NA_real_),
+         DV = if_else(EVID == 1 | BLOQ == 1, NA_real_, DV),
+         MDV = if_else(is.na(DV), 1, 0)) %>% 
+  relocate(DV, .after = last_col()) %>% 
+  relocate(TIME, .before = DV) %>% 
+  mutate(solver = "mat_exp")
+
+
+stan_data$solver <- 3
+simulated_data <- model$sample(data = stan_data,
+                               fixed_param = TRUE,
+                               seed = 1123,
+                               iter_warmup = 0,
+                               iter_sampling = 1,
+                               chains = 1,
+                               parallel_chains = 1)
+
+data_rk45 <- simulated_data$draws(c("dv", "ipred")) %>% 
+  spread_draws(dv[i], ipred[i]) %>% 
+  ungroup() %>% 
+  inner_join(nonmem_data_simulate %>% 
+               mutate(i = 1:n()),
+             by = "i") %>%
+  select(ID, AMT, II, ADDL, RATE, CMT, EVID, SS, TIME, 
+         DV = "dv", IPRED = "ipred") %>% 
+  mutate(LLOQ = 1e-6, 
+         BLOQ = case_when(EVID == 1 ~ NA_real_,
+                          DV <= LLOQ ~ 1,
+                          DV > LLOQ ~ 0,
+                          TRUE ~ NA_real_),
+         DV = if_else(EVID == 1 | BLOQ == 1, NA_real_, DV),
+         MDV = if_else(is.na(DV), 1, 0)) %>% 
+  relocate(DV, .after = last_col()) %>% 
+  relocate(TIME, .before = DV) %>% 
+  mutate(solver = "rk45")
+
+## Now do it with mrgsolve to check
+
+mod <- mread(here::here("depot_1cmt_linear/mrgsolve/depot_1cmt_exp.cpp"))
+
+data_mrgsolve <- mod %>% 
+  param(tibble(CL = TVCL,
+               VC = TVVC,
+               KA = TVKA,
+               F1 = 1,
+               LAGTIME = 0)) %>% 
+  data_set(dosing_data) %>% 
+  mrgsim_df(tgrid = times_to_simulate) %>% 
+  as_tibble() %>% 
+  mutate(solver = "mrgsolve")
+```
+
+
+```{r}
+#| fig-align: center
+#| 
+mget(str_subset(ls(), "^data_")) %>%
+  bind_rows() %>% 
+  ggplot(aes(x = TIME, y = IPRED, color = solver)) +
+  geom_line(aes(linetype = solver)) +
+  theme_bw() +
+  scale_x_continuous(name = "Time (h)",
+                     breaks = seq(0, 168, by = 24),
+                     labels = seq(0, 168, by = 24)) +
+  scale_y_continuous(name = "Drug Conc. (ug/mL)")
+
+
+```
+
+So you can see that the analytical solution spits out a vector of 0s, while the
+linear ODE, general ODE, and mrgsolve simulations are all the same.
+
+
+### Two-Compartment IV with Proportional Error
+
+The following code simulates with Stan + Torsten with an analytical solution, 
+linear ODE solution, and general ODE solution using code I've written in the 
+past, and then also a simulation with mrgsolve as a comparison.
+
+:::{.scrolling_500}
+
+```{r}
+#| cache: true
+
+TVCL <- 0.25  # L/d
+TVVC <- 3     # L
+TVQ <- 1      # L/d
+TVVP <- 4     # L
+
+omega_cl <- 0
+omega_vc <- 0
+omega_q <- 0
+omega_vp <- 0
+
+R <- diag(rep(1, times = 4))
+
+sigma_p <- 0.2
+sigma_a <- 0.05
+
+cor_p_a <- 0
+
+solver <- 1 # analytical = 1, mat exp = 2, rk45 = 3
+
+# If using Torsten's analytical solver, dose into the second compartment 
+# (cmt = 2). If using matrix-exponential or ODE, then dose into the first
+# compartment (cmt = 1)
+dosing_data <- expand.ev(ID = 1, addl = 5, ii = 14, 
+                         cmt = 2, amt = 400, ss = 0, 
+                         tinf = 1/24, evid = 1) %>%
+  as_tibble() %>% 
+  mutate(cmt = if_else(solver == 1, 2, 1)) %>% 
+  rename_all(toupper) %>%
+  select(ID, TIME, everything()) 
+
+times_to_simulate <- seq(0, 84*24, by = 1)/24
+
+nonmem_data_simulate <- dosing_data %>% 
+  group_by(ID) %>% 
+  slice(rep(1, times = length(times_to_simulate))) %>% 
+  mutate(AMT = 0,
+         ADDL = 0,
+         II = 0,
+         CMT = if_else(solver == 1, 2, 1),
+         EVID = 0,
+         RATE = 0,
+         TIME = times_to_simulate) %>% 
+  ungroup() %>%
+  bind_rows(dosing_data) %>% 
+  arrange(ID, TIME, AMT)
+
+n_subjects <- nonmem_data_simulate %>%  # number of individuals to simulate
+  distinct(ID) %>% 
+  count() %>% 
+  deframe()
+
+n_total <- nrow(nonmem_data_simulate) # total number of time points at which to predict
+
+subj_start <- nonmem_data_simulate %>% 
+  mutate(row_num = 1:n()) %>% 
+  group_by(ID) %>% 
+  slice_head(n = 1) %>%
+  ungroup() %>% 
+  select(row_num) %>% 
+  deframe()
+
+subj_end <- c(subj_start[-1] - 1, n_total) 
+
+stan_data <- list(n_subjects = n_subjects,
+                  n_total = n_total,
+                  time = nonmem_data_simulate$TIME,
+                  amt = nonmem_data_simulate$AMT,
+                  cmt = nonmem_data_simulate$CMT,
+                  evid = nonmem_data_simulate$EVID,
+                  rate = nonmem_data_simulate$RATE,
+                  ii = nonmem_data_simulate$II,
+                  addl = nonmem_data_simulate$ADDL,
+                  ss = nonmem_data_simulate$SS,
+                  subj_start = subj_start,
+                  subj_end = subj_end,
+                  TVCL = TVCL,
+                  TVVC = TVVC,
+                  TVQ = TVQ,
+                  TVVP = TVVP,
+                  omega_cl = omega_cl,
+                  omega_vc = omega_vc,
+                  omega_q = omega_q,
+                  omega_vp = omega_vp,
+                  R = R,
+                  sigma_p = sigma_p,
+                  sigma_a = sigma_a,
+                  cor_p_a = cor_p_a,
+                  solver = solver) # analytical = 1, mat exp = 2, rk45 = 3
+
+model <- cmdstan_model(
+  here::here("iv_2cmt_linear/Stan/Simulate/iv_2cmt_ppa.stan"))
+
+model$print()
+```
+
+:::
+
+```{r}
+#| cache: true
+#| output: false
+
+simulated_data <- model$sample(data = stan_data,
+                               fixed_param = TRUE,
+                               seed = 112358,
+                               iter_warmup = 0,
+                               iter_sampling = 1,
+                               chains = 1,
+                               parallel_chains = 1)
+
+data_analytical <- simulated_data$draws(c("dv", "ipred")) %>% 
+  spread_draws(dv[i], ipred[i]) %>% 
+  ungroup() %>% 
+  inner_join(nonmem_data_simulate %>% 
+               mutate(i = 1:n()),
+             by = "i") %>%
+  select(ID, AMT, II, ADDL, RATE, CMT, EVID, SS, TIME, 
+         DV = "dv", IPRED = "ipred") %>% 
+  mutate(LLOQ = 1e-6, 
+         BLOQ = case_when(EVID == 1 ~ NA_real_,
+                          DV <= LLOQ ~ 1,
+                          DV > LLOQ ~ 0,
+                          TRUE ~ NA_real_),
+         DV = if_else(EVID == 1 | BLOQ == 1, NA_real_, DV),
+         MDV = if_else(is.na(DV), 1, 0)) %>% 
+  relocate(DV, .after = last_col()) %>% 
+  relocate(TIME, .before = DV) %>% 
+  mutate(solver = "analytical")
+
+
+solver <- 2
+dosing_data <- dosing_data %>% 
+  mutate(CMT = if_else(solver == 1, 2, 1)) 
+  
+nonmem_data_simulate <- dosing_data %>% 
+  group_by(ID) %>% 
+  slice(rep(1, times = length(times_to_simulate))) %>% 
+  mutate(AMT = 0,
+         ADDL = 0,
+         II = 0,
+         CMT = if_else(solver == 1, 2, 1),
+         EVID = 0,
+         RATE = 0,
+         TIME = times_to_simulate) %>% 
+  ungroup() %>%
+  bind_rows(dosing_data) %>% 
+  arrange(ID, TIME, AMT) 
+
+stan_data <- list(n_subjects = n_subjects,
+                  n_total = n_total,
+                  time = nonmem_data_simulate$TIME,
+                  amt = nonmem_data_simulate$AMT,
+                  cmt = nonmem_data_simulate$CMT,
+                  evid = nonmem_data_simulate$EVID,
+                  rate = nonmem_data_simulate$RATE,
+                  ii = nonmem_data_simulate$II,
+                  addl = nonmem_data_simulate$ADDL,
+                  ss = nonmem_data_simulate$SS,
+                  subj_start = subj_start,
+                  subj_end = subj_end,
+                  TVCL = TVCL,
+                  TVVC = TVVC,
+                  TVQ = TVQ,
+                  TVVP = TVVP,
+                  omega_cl = omega_cl,
+                  omega_vc = omega_vc,
+                  omega_q = omega_q,
+                  omega_vp = omega_vp,
+                  R = R,
+                  sigma_p = sigma_p,
+                  sigma_a = sigma_a,
+                  cor_p_a = cor_p_a,
+                  solver = solver) 
+
+simulated_data <- model$sample(data = stan_data,
+                               fixed_param = TRUE,
+                               seed = 112358,
+                               iter_warmup = 0,
+                               iter_sampling = 1,
+                               chains = 1,
+                               parallel_chains = 1)
+
+data_mat_exp <- simulated_data$draws(c("dv", "ipred")) %>% 
+  spread_draws(dv[i], ipred[i]) %>% 
+  ungroup() %>% 
+  inner_join(nonmem_data_simulate %>% 
+               mutate(i = 1:n()),
+             by = "i") %>%
+  select(ID, AMT, II, ADDL, RATE, CMT, EVID, SS, TIME, 
+         DV = "dv", IPRED = "ipred") %>% 
+  mutate(LLOQ = 1e-6, 
+         BLOQ = case_when(EVID == 1 ~ NA_real_,
+                          DV <= LLOQ ~ 1,
+                          DV > LLOQ ~ 0,
+                          TRUE ~ NA_real_),
+         DV = if_else(EVID == 1 | BLOQ == 1, NA_real_, DV),
+         MDV = if_else(is.na(DV), 1, 0)) %>% 
+  relocate(DV, .after = last_col()) %>% 
+  relocate(TIME, .before = DV) %>% 
+  mutate(solver = "mat_exp")
+
+
+
+
+solver <- 3
+stan_data$solver <- solver
+
+simulated_data <- model$sample(data = stan_data,
+                               fixed_param = TRUE,
+                               seed = 112358,
+                               iter_warmup = 0,
+                               iter_sampling = 1,
+                               chains = 1,
+                               parallel_chains = 1)
+
+data_rk45 <- simulated_data$draws(c("dv", "ipred")) %>% 
+  spread_draws(dv[i], ipred[i]) %>% 
+  ungroup() %>% 
+  inner_join(nonmem_data_simulate %>% 
+               mutate(i = 1:n()),
+             by = "i") %>%
+  select(ID, AMT, II, ADDL, RATE, CMT, EVID, SS, TIME, 
+         DV = "dv", IPRED = "ipred") %>% 
+  mutate(LLOQ = 1e-6, 
+         BLOQ = case_when(EVID == 1 ~ NA_real_,
+                          DV <= LLOQ ~ 1,
+                          DV > LLOQ ~ 0,
+                          TRUE ~ NA_real_),
+         DV = if_else(EVID == 1 | BLOQ == 1, NA_real_, DV),
+         MDV = if_else(is.na(DV), 1, 0)) %>% 
+  relocate(DV, .after = last_col()) %>% 
+  relocate(TIME, .before = DV) %>% 
+  mutate(solver = "rk45")
+
+
+## Now do it with mrgsolve to check
+
+mod <- mread(here::here("iv_2cmt_linear/mrgsolve/iv_2cmt_ppa.cpp"))
+
+data_mrgsolve <- mod %>% 
+  param(tibble(TVCL = TVCL,
+               TVVC = TVVC,
+               TVQ = TVQ,
+               TVVP = TVVP)) %>% 
+  data_set(dosing_data) %>% 
+  mrgsim_df(tgrid = times_to_simulate) %>% 
+  as_tibble() %>% 
+  mutate(solver = "mrgsolve")
+
+
+```
+
+
+```{r}
+#| fig-align: center
+
+mget(str_subset(ls(), "^data_")) %>%
+  bind_rows() %>% 
+  ggplot(aes(x = TIME, y = IPRED, color = solver)) +
+  geom_line(aes(linetype = solver)) +
+  theme_bw() +
+  scale_x_continuous(name = "Time (h)",
+                     breaks = seq(0, 168, by = 24),
+                     labels = seq(0, 168, by = 24)) +
+  scale_y_continuous(name = "Drug Conc. (ug/mL)")
+
+
+```
+
+So you can see that the analytical solution spits out a vector of 0s, while the
+linear ODE, general ODE, and mrgsolve simulations are all the same.
+
+## Fitting ```pk2cpt```, ```pk2cpt_linode```, ```pk2cpt_ode``` from ```example-models/```
+
+I made a few modifications in the R script to fit the project and a couple 
+small changes in the general ODE model while trying to debug it, but no changes 
+of any major substance.
+
+### ```pk2cpt```
+
+:::{.scrolling_500}
+
+```{r}
+
+model_analytical <- cmdstan_model(
+  here::here("example_models_metrum/pk2cpt/pk2cpt.stan"))
+
+fit_analytical <- model_analytical$sample(
+  data = here::here("example_models_metrum/pk2cpt/pk2cpt.data.R"), 
+  init = here::here("example_models_metrum/pk2cpt/pk2cpt.init.R"), 
+  seed = 3191951,
+  chains = 1,
+  parallel_chains = 1,
+  iter_warmup = 500,
+  iter_sampling = 1000,
+  adapt_delta = 0.80)
+
+```
+
+:::
+
+In particular, 
+```Chain 1 Exception: normal_lpdf: Location parameter[1] is -inf, but must be finite!```
+implies that the prediction is 0.
+
+### ```pk2cpt_linode```
+
+:::{.scrolling_500}
+
+```{r}
+#| cache: true
+
+model_mat_exp <- cmdstan_model(
+  here::here("example_models_metrum/pk2cpt_linode/pk2cpt_linode.stan"))
+
+fit_mat_exp <- model_mat_exp$sample(
+  data = here::here("example_models_metrum/pk2cpt_linode/pk2cpt_linode.data.R"), 
+  init = here::here("example_models_metrum/pk2cpt_linode/pk2cpt_linode.init.R"), 
+  seed = 3191951,
+  chains = 4,
+  parallel_chains = 4,
+  iter_warmup = 500,
+  iter_sampling = 1000,
+  refresh = 0,
+  adapt_delta = 0.80)
+
+```
+
+:::
+
+Works fine. I also fit the ```pk2cpt``` and ```pk2cpt_ode``` data with this 
+model with no issues.
+
+### ```pk2cpt_ode```
+
+:::{.scrolling_500}
+
+```{r}
+#| cache: true
+
+model_rk45 <- cmdstan_model(
+  here::here("example_models_metrum/pk2cpt_ode/pk2cpt_ode.stan"))
+
+stan_data_rk45 <- rstan::read_rdump(
+  here::here("example_models_metrum/pk2cpt_ode/pk2cpt_ode.data.R"))
+
+stan_data_rk45$prior_only <- 1
+
+fit_rk45 <- model_rk45$sample(
+  data = stan_data_rk45, 
+  init = here::here("example_models_metrum/pk2cpt_ode/pk2cpt_ode.init.R"), 
+  seed = 3191951,
+  chains = 1,
+  parallel_chains = 1,
+  iter_warmup = 1,
+  iter_sampling = 1,
+  adapt_delta = 0.80)
+
+```
+
+:::
+
+As you can see, it's returning a vector of 0s as the solution.
+
+## Fitting ```poppk2cpt``` from ```example-models/```
+
+I made a couple adjustments in ```poppk2cpt.stan``` so that it can be fit with
+an analytical solver, the linear ODE, or the general ODE.
+
+### Analytical Solution
+
+:::{.scrolling_500}
+
+```{r}
+#| cache: true
+
+model <- cmdstan_model(
+  here::here("example_models_metrum/poppk2cpt/poppk2cpt.stan"))
+
+stan_data <- rstan::read_rdump(
+  here::here("example_models_metrum/poppk2cpt/poppk2cpt.data.R"))
+
+stan_data$solver <- 1
+
+fit_analytical <- model$sample(
+  data = stan_data, 
+  init = here::here("example_models_metrum/poppk2cpt/poppk2cpt.init.R"), 
+  seed = 3191951,
+  chains = 4,
+  parallel_chains = 4,
+  iter_warmup = 500,
+  iter_sampling = 500,
+  adapt_delta = 0.80)
+
+
+```
+
+:::
+
+This one fits fine.
+
+### Linear ODE Solution
+
+:::{.scrolling_500}
+
+```{r}
+#| cache: true
+
+stan_data$solver <- 2
+
+fit_mat_exp <- model$sample(
+  data = stan_data, 
+  init = here::here("example_models_metrum/poppk2cpt/poppk2cpt.init.R"), 
+  seed = 3191951,
+  chains = 4,
+  parallel_chains = 4,
+  iter_warmup = 1,
+  iter_sampling = 1,
+  adapt_delta = 0.80)
+```
+
+:::
+
+This one doesn't work.
+
+### General ODE Solution
+
+:::{.scrolling_500}
+
+```{r}
+#| cache: true
+
+stan_data$solver <- 3
+
+fit_rk45 <- model$sample(
+  data = stan_data, 
+  init = here::here("example_models_metrum/poppk2cpt/poppk2cpt.init.R"), 
+  seed = 3191951,
+  chains = 4,
+  parallel_chains = 4,
+  iter_warmup = 300,
+  iter_sampling = 100,
+  adapt_delta = 0.80)
+```
+
+:::
+
+This one works.
+
+## Fitting ```poppk2cpt``` from ```example-models/``` With My Own Models
+
+I've previously written this model to fit with the analytical, linear ODE, and
+general ODE solutions with proportional error, so I'm just going to use that, 
+but it shouldn't make a difference.
+
+### Data Wrangling
+
+My models should work from a NONMEM dataset in .csv format, so I'll wrangle the
+data into something like that first.
+
+```{r}
+dv <- rep(NA, stan_data$nt)
+dv[stan_data$iObs] <- stan_data$cObs
+
+nonmem_data <- with(stan_data, 
+                    tibble(ID = rep(1:stan_data$nSubj, each = 54),
+                           amt = amt, 
+                           ii = ii,
+                           addl = addl,
+                           rate = rate,
+                           cmt = cmt,
+                           evid = evid, 
+                           ss = ss,
+                           lloq = 0,
+                           bloq = 0,
+                           time = time,
+                           DV = dv)) %>% 
+  mutate(DV = if_else(is.na(DV), 5555555, DV),    # This value can be anything except NA. It'll be indexed away 
+         bloq = if_else(is.na(bloq), -999, bloq)) # This value can be anything except NA. It'll be indexed away 
+
+n_subjects <- nonmem_data %>%  # number of individuals
+  distinct(ID) %>%
+  count() %>%
+  deframe()
+
+n_total <- nrow(nonmem_data)   # total number of records
+
+i_obs <- nonmem_data %>%
+  mutate(row_num = 1:n()) %>%
+  filter(evid == 0) %>%
+  select(row_num) %>%
+  deframe()
+
+n_obs <- length(i_obs)
+
+subj_start <- nonmem_data %>%
+  mutate(row_num = 1:n()) %>%
+  group_by(ID) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  select(row_num) %>%
+  deframe()
+
+subj_end <- c(subj_start[-1] - 1, n_total)
+
+stan_data <- list(n_subjects = n_subjects,
+                  n_total = n_total,
+                  n_obs = n_obs,
+                  i_obs = i_obs,
+                  ID = nonmem_data$ID,
+                  amt = nonmem_data$amt,
+                  cmt = nonmem_data$cmt,
+                  evid = nonmem_data$evid,
+                  rate = nonmem_data$rate,
+                  ii = nonmem_data$ii,
+                  addl = nonmem_data$addl,
+                  ss = nonmem_data$ss,
+                  time = nonmem_data$time,
+                  dv = nonmem_data$DV,
+                  subj_start = subj_start,
+                  subj_end = subj_end,
+                  lloq = nonmem_data$lloq,
+                  bloq = nonmem_data$bloq,
+                  location_tvcl = 0.75,
+                  location_tvvc = 18,
+                  location_tvq = 3,
+                  location_tvvp = 35,
+                  location_tvka = 0.8,
+                  scale_tvcl = 1,
+                  scale_tvvc = 1,
+                  scale_tvq = 1,
+                  scale_tvvp = 1,
+                  scale_tvka = 1,
+                  scale_omega_cl = 0.4,
+                  scale_omega_vc = 0.4,
+                  scale_omega_q = 0.4,
+                  scale_omega_vp = 0.4,
+                  scale_omega_ka = 0.4,
+                  lkj_df_omega = 2,
+                  scale_sigma_p = 0.5,
+                  prior_only = 0)
+
+model <- cmdstan_model(
+  here::here("depot_2cmt_linear/Stan/Fit/depot_2cmt_prop_all_solvers.stan"),
+  cpp_options = list(stan_threads = TRUE))
+```
+
+### Analytical Solution
+
+:::{.scrolling_500}
+
+```{r}
+#| cache: true
+
+stan_data$solver <- 1
+
+fit <- model$sample(data = stan_data,
+                    seed = 11235,
+                    chains = 4,
+                    parallel_chains = 4,
+                    threads_per_chain = parallel::detectCores()/4,
+                    iter_warmup = 500,
+                    iter_sampling = 1000,
+                    adapt_delta = 0.8,
+                    refresh = 500,
+                    max_treedepth = 10,
+                    init = function() list(TVCL = rlnorm(1, log(5), 0.1),
+                                           TVVC = rlnorm(1, log(20), 0.1),
+                                           TVQ = rlnorm(1, log(7), 0.1),
+                                           TVVP = rlnorm(1, log(70), 0.1),
+                                           TVKA = rlnorm(1, log(1.2), 0.1),
+                                           omega = rlnorm(5, log(0.1), 0.1),
+                                           sigma_p = rlnorm(1, log(0.1), 0.1)))
+```
+
+:::
+
+Doesn't work.
+
+### Linear ODE
+
+:::{.scrolling_500}
+
+```{r}
+#| cache: true
+
+stan_data$solver <- 2
+
+fit_mat_exp_cd <- model$sample(
+  data = stan_data,
+  seed = 11235,
+  chains = 4,
+  parallel_chains = 4,
+  threads_per_chain = parallel::detectCores()/4,
+  iter_warmup = 500,
+  iter_sampling = 1000,
+  adapt_delta = 0.8,
+  refresh = 500,
+  max_treedepth = 10,
+  init = function() list(TVCL = rlnorm(1, log(5), 0.1),
+                         TVVC = rlnorm(1, log(20), 0.1),
+                         TVQ = rlnorm(1, log(7), 0.1),
+                         TVVP = rlnorm(1, log(70), 0.1),
+                         TVKA = rlnorm(1, log(1.2), 0.1),
+                         omega = rlnorm(5, log(0.1), 0.1),
+                         sigma_p = rlnorm(1, log(0.1), 0.1)))
+```
+
+:::
+
+This one works fine.
+
+### General ODE
+
+:::{.scrolling_500}
+
+```{r}
+#| cache: true
+ 
+stan_data$solver <- 3
+
+fit_rk45_cd <- model$sample(
+  data = stan_data,
+  seed = 11235,
+  chains = 4,
+  parallel_chains = 4,
+  threads_per_chain = parallel::detectCores()/4,
+  iter_warmup = 300,
+  iter_sampling = 100,
+  adapt_delta = 0.8,
+  refresh = 0,
+  max_treedepth = 10,
+  init = function() list(TVCL = rlnorm(1, log(5), 0.1),
+                         TVVC = rlnorm(1, log(20), 0.1),
+                         TVQ = rlnorm(1, log(7), 0.1),
+                         TVVP = rlnorm(1, log(70), 0.1),
+                         TVKA = rlnorm(1, log(1.2), 0.1),
+                         omega = rlnorm(5, log(0.1), 0.1),
+                         sigma_p = rlnorm(1, log(0.1), 0.1)))
+
+
+```
+
+:::
+
+This one works fine.
+
+# Summary
+
+Basically, I haven't figured out if there's any rhyme or reason to when the 
+analytical, linear ODE, or general ODE solution works or not. 
+
+# Session Info
+
+```{r}
+
+sessionInfo()
+
+```
+
