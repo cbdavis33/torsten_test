@@ -1,5 +1,5 @@
 ---
-title: "Torsten Issues"
+title: "Torsten Testing on an M2"
 author: "Casey Davis"
 date: "`r format(Sys.time(), '%B %d, %Y')`"
 format:
@@ -52,15 +52,15 @@ Macbook Pro. I brought up an issue with M3 compatibility
 Thank you for fixing that issue. Now I'm doing some more testing, and I'm 
 finding some issues with the Torsten solvers.
 
-I've mostly done testing on my own models, but I've also worked on the 
-```pk2cpt```, ```pk2cpt_linode```, ```pk2cpt_ode```, and ```poppk2cpt``` models,
-For the single subject models, the analytical solution didn't work, the linear 
-ODE solution worked, and the ODE solution didn't work (although I'm not exactly 
-sure why the ODE solution didn't work. Still needs worked on, I guess.) For the 
-population model, the analytical solution and the ODE solution worked with the
-model that you've written, but the linear ODE soolution didn't work. So I then
-used the data in ```poppk2cpt``` and fit it with a model I've written, and the
-linear ODE and general ODE solutions worked, but the analytical solution didn't.
+<!-- I've mostly done testing on my own models, but I've also worked on the  -->
+<!-- ```pk2cpt```, ```pk2cpt_linode```, ```pk2cpt_ode```, and ```poppk2cpt``` models, -->
+<!-- For the single subject models, the analytical solution didn't work, the linear  -->
+<!-- ODE solution worked, and the ODE solution didn't work (although I'm not exactly  -->
+<!-- sure why the ODE solution didn't work. Still needs worked on, I guess.) For the  -->
+<!-- population model, the analytical solution and the ODE solution worked with the -->
+<!-- model that you've written, but the linear ODE soolution didn't work. So I then -->
+<!-- used the data in ```poppk2cpt``` and fit it with a model I've written, and the -->
+<!-- linear ODE and general ODE solutions worked, but the analytical solution didn't. -->
 
 # Some Examples
 
@@ -282,8 +282,9 @@ mget(str_subset(ls(), "^data_")) %>%
 
 ```
 
-So you can see that the analytical solution spits out a vector of 0s, while the
-linear ODE, general ODE, and mrgsolve simulations are all the same.
+So you can see for the M2, the analytical soultion, linear ODE, general ODE, 
+and mrgsolve simulations are all the same, in contrast with the M3 where the 
+analytical solution was a vector of zeros.
 
 
 ### Two-Compartment IV with Proportional Error
@@ -565,8 +566,9 @@ mget(str_subset(ls(), "^data_")) %>%
 
 ```
 
-So you can see that the analytical solution spits out a vector of 0s, while the
-linear ODE, general ODE, and mrgsolve simulations are all the same.
+So you can see for the M2, the analytical soultion, linear ODE, general ODE, 
+and mrgsolve simulations are all the same, in contrast with the M3 where the 
+analytical solution was a vector of zeros.
 
 ## Fitting ```pk2cpt```, ```pk2cpt_linode```, ```pk2cpt_ode``` from ```example-models/```
 
@@ -597,9 +599,7 @@ fit_analytical <- model_analytical$sample(
 
 :::
 
-In particular, 
-```Chain 1 Exception: normal_lpdf: Location parameter[1] is -inf, but must be finite!```
-implies that the prediction is 0.
+This seems to work, in contrast to the M3 where we had a vector of zeros.
 
 ### ```pk2cpt_linode```
 
@@ -626,8 +626,8 @@ fit_mat_exp <- model_mat_exp$sample(
 
 :::
 
-Works fine. I also fit the ```pk2cpt``` and ```pk2cpt_ode``` data with this 
-model with no issues.
+Works fine.
+
 
 ### ```pk2cpt_ode```
 
@@ -658,7 +658,8 @@ fit_rk45 <- model_rk45$sample(
 
 :::
 
-As you can see, it's returning a vector of 0s as the solution.
+Works fine, in contrast to the one from the M3, where it was returning a vector
+of zeros.
 
 ## Fitting ```poppk2cpt``` from ```example-models/```
 
@@ -712,14 +713,14 @@ fit_mat_exp <- model$sample(
   seed = 3191951,
   chains = 4,
   parallel_chains = 4,
-  iter_warmup = 1,
-  iter_sampling = 1,
+  iter_warmup = 300,
+  iter_sampling = 100,
   adapt_delta = 0.80)
 ```
 
 :::
 
-This one doesn't work.
+<!-- This one doesn't work. -->
 
 ### General ODE Solution
 
@@ -755,6 +756,8 @@ but it shouldn't make a difference.
 
 My models should work from a NONMEM dataset in .csv format, so I'll wrangle the
 data into something like that first.
+
+:::{.scrolling_500}
 
 ```{r}
 dv <- rep(NA, stan_data$nt)
@@ -843,6 +846,8 @@ model <- cmdstan_model(
   cpp_options = list(stan_threads = TRUE))
 ```
 
+:::
+
 ### Analytical Solution
 
 :::{.scrolling_500}
@@ -873,7 +878,7 @@ fit <- model$sample(data = stan_data,
 
 :::
 
-Doesn't work.
+Seems to work fine.
 
 ### Linear ODE
 
@@ -945,8 +950,8 @@ This one works fine.
 
 # Summary
 
-Basically, I haven't figured out if there's any rhyme or reason to when the 
-analytical, linear ODE, or general ODE solution works or not. 
+<!-- Basically, I haven't figured out if there's any rhyme or reason to when the  -->
+<!-- analytical, linear ODE, or general ODE solution works or not.  -->
 
 # Session Info
 
